@@ -1,1 +1,791 @@
-tgr5yu
+/**
+ * @file barcode_detector.c
+ * @brief 嵌入式条形码/二维码检测模块实??
+ * @details 用于全国大学生电子设计大赛的通用条形码检测模??
+ * @author 西南科技大学智能系统与智慧服务创新实践班
+ * @date 2025
+ * @version 1.0
+ */
+
+#include "barcode_detector.h"
+#include <string.h>
+#include <stdio.h>
+
+/* ========================= 私有类型定义 ========================= */
+
+/**
+ * @brief 模块内部状态结构体
+ */
+typedef struct {
+    bool is_initialized;                // 初始化标??
+    bool is_continuous_mode;            // 连续检测模式标??
+    barcode_config_t config;            // 当前配置
+    barcode_stats_t stats;              // 统计信息
+    uint16_t roi_x, roi_y;              // 检测区域坐??
+    uint16_t roi_width, roi_height;     // 检测区域尺??
+    uint8_t *image_buffer;              // 图像缓冲??
+    uint32_t buffer_size;               // 缓冲区大??
+} barcode_context_t;
+
+/**
+ * @brief 图像预处理参数结构体
+ */
+typedef struct {
+    uint8_t brightness_adjust;          // 亮度调整
+    uint8_t contrast_adjust;            // 对比度调??
+    bool enable_noise_reduction;        // 噪声抑制
+    bool enable_edge_enhancement;       // 边缘增强
+} image_preprocess_params_t;
+
+/* ========================= 私有变量定义 ========================= */
+
+static barcode_context_t g_barcode_ctx = {0};
+
+// 类型名称映射??
+static const char* g_type_names[] = {
+    "UNKNOWN",
+    "QR_CODE",
+    "CODE128",
+    "CODE39",
+    "EAN13",
+    "EAN8",
+    "UPC_A",
+    "UPC_E",
+    "DATAMATRIX",
+    "PDF417",
+    "AZTEC"
+};
+
+/* ========================= 私有函数声明 ========================= */
+
+static barcode_status_e barcode_validate_config(const barcode_config_t *config);
+static barcode_status_e barcode_allocate_buffers(void);
+static void barcode_free_buffers(void);
+static uint8_t barcode_preprocess_image(const uint8_t *src, uint8_t *dst, 
+                                       const image_preprocess_params_t *params);
+static uint8_t barcode_detect_qr_code(const uint8_t *image_data, 
+                                     barcode_result_t *results, uint8_t max_results);
+static uint8_t barcode_detect_code128(const uint8_t *image_data, 
+                                     barcode_result_t *results, uint8_t max_results);
+static uint8_t barcode_detect_ean_codes(const uint8_t *image_data, 
+                                       barcode_result_t *results, uint8_t max_results);
+static void barcode_update_stats(bool success);
+static uint8_t barcode_calculate_confidence(const uint8_t *region, 
+                                           uint16_t width, uint16_t height);
+static bool barcode_validate_result(const barcode_result_t *result);
+static void barcode_filter_results(barcode_result_t *results, uint8_t *count);
+
+/* ========================= API函数实现 ========================= */
+
+/**
+ * @brief 条形码检测模块初始化
+ */
+barcode_status_e barcode_detector_init(const barcode_config_t *config)
+{
+    BARCODE_DEBUG("Initializing barcode detector...");
+    
+    // 检查是否已经初始化
+    if (g_barcode_ctx.is_initialized) {
+        BARCODE_DEBUG("Already initialized");
+        return BARCODE_OK;
+    }
+    
+    // 清零上下??
+    memset(&g_barcode_ctx, 0, sizeof(barcode_context_t));
+    
+    // 设置默认配置或用户配??
+    if (config != NULL) {
+        barcode_status_e status = barcode_validate_config(config);
+        if (status != BARCODE_OK) {
+            BARCODE_ERROR_RETURN(true, status, "Invalid configuration");
+        }
+        g_barcode_ctx.config = *config;
+    } else {
+        // 使用默认配置
+        g_barcode_ctx.config.format = BARCODE_FORMAT_GRAY;
+        g_barcode_ctx.config.img_width = BARCODE_IMAGE_WIDTH;
+        g_barcode_ctx.config.img_height = BARCODE_IMAGE_HEIGHT;
+        g_barcode_ctx.config.enable_preprocess = BARCODE_ENABLE_PREPROCESS;
+        g_barcode_ctx.config.confidence_thresh = BARCODE_CONFIDENCE_THRESH;
+        g_barcode_ctx.config.timeout_ms = BARCODE_TIMEOUT_MS;
+        g_barcode_ctx.config.max_results = BARCODE_MAX_RESULTS;
+    }
+    
+    // 设置默认检测区域为全图
+    g_barcode_ctx.roi_x = 0;
+    g_barcode_ctx.roi_y = 0;
+    g_barcode_ctx.roi_width = g_barcode_ctx.config.img_width;
+    g_barcode_ctx.roi_height = g_barcode_ctx.config.img_height;
+    
+    // 分配内存缓冲??
+    barcode_status_e alloc_status = barcode_allocate_buffers();
+    if (alloc_status != BARCODE_OK) {
+        BARCODE_ERROR_RETURN(true, alloc_status, "Buffer allocation failed");
+    }
+    
+    // 初始化统计信??
+    memset(&g_barcode_ctx.stats, 0, sizeof(barcode_stats_t));
+    
+    g_barcode_ctx.is_initialized = true;
+    BARCODE_DEBUG("Barcode detector initialized successfully");
+    
+    return BARCODE_OK;
+}
+
+/**
+ * @brief 从图像数据中检测条形码
+ */
+uint8_t barcode_detector_scan(const uint8_t *image_data, 
+                             barcode_result_t *results, 
+                             uint8_t max_results)
+{
+    // 参数检??
+    if (!g_barcode_ctx.is_initialized) {
+        BARCODE_DEBUG("Module not initialized");
+        barcode_update_stats(false);
+        return 0;
+    }
+    
+    if (image_data == NULL || results == NULL || max_results == 0) {
+        BARCODE_DEBUG("Invalid parameters");
+        barcode_update_stats(false);
+        return 0;
+    }
+    
+    uint32_t start_time = user_get_timestamp_ms();
+    uint8_t total_results = 0;
+    uint8_t temp_results[BARCODE_MAX_RESULTS];
+    uint8_t temp_count = 0;
+    
+    BARCODE_DEBUG("Starting barcode scan...");
+    
+    // 图像预处理（如果启用??
+    const uint8_t *process_data = image_data;
+    if (g_barcode_ctx.config.enable_preprocess && g_barcode_ctx.image_buffer != NULL) {
+        image_preprocess_params_t preprocess_params = {
+            .brightness_adjust = 10,
+            .contrast_adjust = 15,
+            .enable_noise_reduction = true,
+            .enable_edge_enhancement = true
+        };
+        
+        if (barcode_preprocess_image(image_data, g_barcode_ctx.image_buffer, 
+                                   &preprocess_params)) {
+            process_data = g_barcode_ctx.image_buffer;
+            BARCODE_DEBUG("Image preprocessed");
+        }
+    }
+    
+    // 检测QR??
+    temp_count = barcode_detect_qr_code(process_data, 
+                                       (barcode_result_t*)temp_results, 
+                                       max_results);
+    if (temp_count > 0) {
+        memcpy(&results[total_results], temp_results, 
+               temp_count * sizeof(barcode_result_t));
+        total_results += temp_count;
+        BARCODE_DEBUG("Found %d QR codes", temp_count);
+    }
+    
+    // 检测Code128（如果还有空间）
+    if (total_results < max_results) {
+        temp_count = barcode_detect_code128(process_data, 
+                                          (barcode_result_t*)temp_results, 
+                                          max_results - total_results);
+        if (temp_count > 0) {
+            memcpy(&results[total_results], temp_results, 
+                   temp_count * sizeof(barcode_result_t));
+            total_results += temp_count;
+            BARCODE_DEBUG("Found %d Code128 barcodes", temp_count);
+        }
+    }
+    
+    // 检测EAN码（如果还有空间??
+    if (total_results < max_results) {
+        temp_count = barcode_detect_ean_codes(process_data, 
+                                            (barcode_result_t*)temp_results, 
+                                            max_results - total_results);
+        if (temp_count > 0) {
+            memcpy(&results[total_results], temp_results, 
+                   temp_count * sizeof(barcode_result_t));
+            total_results += temp_count;
+            BARCODE_DEBUG("Found %d EAN barcodes", temp_count);
+        }
+    }
+    
+    // 过滤和验证结??
+    barcode_filter_results(results, &total_results);
+    
+    // 设置时间??
+    uint32_t current_time = user_get_timestamp_ms();
+    for (uint8_t i = 0; i < total_results; i++) {
+        results[i].timestamp = current_time;
+    }
+    检查超??
+    // 
+    if ((current_time - start_time) > g_barcode_ctx.config.timeout_ms) {
+        BARCODE_DEBUG("Detection timeout");
+        barcode_update_stats(false);
+        return 0;
+    }
+    
+    // 更新统计信息
+    barcode_update_stats(total_results > 0);
+    
+    BARCODE_DEBUG("Scan completed: %d results found in %d ms", 
+                  total_results, current_time - start_time);
+    
+    return total_results;
+}
+
+/**
+ * @brief 连续检测模式启??
+ */
+barcode_status_e barcode_detector_continuous(bool enable)
+{
+    if (!g_barcode_ctx.is_initialized) {
+        BARCODE_ERROR_RETURN(true, BARCODE_ERROR_INIT, "Module not initialized");
+    }
+    
+    if (enable) {
+        if (!g_barcode_ctx.is_continuous_mode) {
+            g_barcode_ctx.is_continuous_mode = true;
+            BARCODE_DEBUG("Continuous mode started");
+            
+            // 启动连续检测线程或定时器（伪代码）
+            // 实际实现需要根据具体RTOS或裸机环境调??
+            while (g_barcode_ctx.is_continuous_mode) {
+                uint32_t image_size = user_get_image_data(g_barcode_ctx.image_buffer, 
+                                                        g_barcode_ctx.buffer_size);
+                if (image_size > 0) {
+                    barcode_result_t results[BARCODE_MAX_RESULTS];
+                    uint8_t count = barcode_detector_scan(g_barcode_ctx.image_buffer, 
+                                                        results, BARCODE_MAX_RESULTS);
+                    if (count > 0) {
+                        user_barcode_callback(results, count);
+                    }
+                }
+                user_delay_ms(100); // 100ms间隔
+            }
+        }
+    } else {
+        g_barcode_ctx.is_continuous_mode = false;
+        BARCODE_DEBUG("Continuous mode stopped");
+    }
+    
+    return BARCODE_OK;
+}
+
+/**
+ * @brief 设置检测区??
+ */
+barcode_status_e barcode_detector_set_roi(uint16_t x, uint16_t y, 
+                                          uint16_t width, uint16_t height)
+{
+    if (!g_barcode_ctx.is_initialized) {
+        BARCODE_ERROR_RETURN(true, BARCODE_ERROR_INIT, "Module not initialized");
+    }
+    
+    // 检查区域是否在图像范围??
+    if (x + width > g_barcode_ctx.config.img_width || 
+        y + height > g_barcode_ctx.config.img_height) {
+        BARCODE_ERROR_RETURN(true, BARCODE_ERROR_PARAM, "ROI exceeds image bounds");
+    }
+    
+    g_barcode_ctx.roi_x = x;
+    g_barcode_ctx.roi_y = y;
+    g_barcode_ctx.roi_width = width;
+    g_barcode_ctx.roi_height = height;
+    
+    BARCODE_DEBUG("ROI set: (%d,%d) %dx%d", x, y, width, height);
+    
+    return BARCODE_OK;
+}
+
+/**
+ * @brief 获取检测统计信??
+ */
+barcode_status_e barcode_detector_get_stats(barcode_stats_t *stats)
+{
+    if (!g_barcode_ctx.is_initialized) {
+        BARCODE_ERROR_RETURN(true, BARCODE_ERROR_INIT, "Module not initialized");
+    }
+    
+    if (stats == NULL) {
+        BARCODE_ERROR_RETURN(true, BARCODE_ERROR_PARAM, "Invalid parameter");
+    }
+    
+    // 计算成功??
+    if (g_barcode_ctx.stats.total_detections > 0) {
+        g_barcode_ctx.stats.success_rate = 
+            (float)g_barcode_ctx.stats.success_detections / 
+            g_barcode_ctx.stats.total_detections * 100.0f;
+    }
+    
+    *stats = g_barcode_ctx.stats;
+    
+    return BARCODE_OK;
+}
+
+/**
+ * @brief 重置检测统计信??
+ */
+barcode_status_e barcode_detector_reset_stats(void)
+{
+    if (!g_barcode_ctx.is_initialized) {
+        BARCODE_ERROR_RETURN(true, BARCODE_ERROR_INIT, "Module not initialized");
+    }
+    
+    memset(&g_barcode_ctx.stats, 0, sizeof(barcode_stats_t));
+    BARCODE_DEBUG("Statistics reset");
+    
+    return BARCODE_OK;
+}
+
+/**
+ * @brief 获取当前配置参数
+ */
+barcode_status_e barcode_detector_get_config(barcode_config_t *config)
+{
+    if (!g_barcode_ctx.is_initialized) {
+        BARCODE_ERROR_RETURN(true, BARCODE_ERROR_INIT, "Module not initialized");
+    }
+    
+    if (config == NULL) {
+        BARCODE_ERROR_RETURN(true, BARCODE_ERROR_PARAM, "Invalid parameter");
+    }
+    
+    *config = g_barcode_ctx.config;
+    
+    return BARCODE_OK;
+}
+
+/**
+ * @brief 更新配置参数
+ */
+barcode_status_e barcode_detector_update_config(const barcode_config_t *config)
+{
+    if (!g_barcode_ctx.is_initialized) {
+        BARCODE_ERROR_RETURN(true, BARCODE_ERROR_INIT, "Module not initialized");
+    }
+    
+    if (config == NULL) {
+        BARCODE_ERROR_RETURN(true, BARCODE_ERROR_PARAM, "Invalid parameter");
+    }
+    
+    barcode_status_e status = barcode_validate_config(config);
+    if (status != BARCODE_OK) {
+        BARCODE_ERROR_RETURN(true, status, "Invalid configuration");
+    }
+    
+    g_barcode_ctx.config = *config;
+    BARCODE_DEBUG("Configuration updated");
+    
+    return BARCODE_OK;
+}
+
+/**
+ * @brief 获取类型名称字符??
+ */
+const char* barcode_detector_get_type_name(barcode_type_e type)
+{
+    if (type >= sizeof(g_type_names) / sizeof(g_type_names[0])) {
+        return "INVALID";
+    }
+    
+    return g_type_names[type];
+}
+
+/**
+ * @brief 条形码检测模块反初始??
+ */
+barcode_status_e barcode_detector_deinit(void)
+{
+    if (!g_barcode_ctx.is_initialized) {
+        return BARCODE_OK;
+    }
+    
+    // 停止连续检??
+    g_barcode_ctx.is_continuous_mode = false;
+    
+    // 释放内存
+    barcode_free_buffers();
+    
+    // 清零上下??
+    memset(&g_barcode_ctx, 0, sizeof(barcode_context_t));
+    
+    BARCODE_DEBUG("Barcode detector deinitialized");
+    
+    return BARCODE_OK;
+}
+
+/* ========================= 私有函数实现 ========================= */
+
+/**
+ * @brief 验证配置参数
+ */
+static barcode_status_e barcode_validate_config(const barcode_config_t *config)
+{
+    if (config == NULL) {
+        return BARCODE_ERROR_PARAM;
+    }
+    
+    if (config->img_width == 0 || config->img_height == 0) {
+        return BARCODE_ERROR_PARAM;
+    }
+    
+    if (config->confidence_thresh > 100) {
+        return BARCODE_ERROR_PARAM;
+    }
+    
+    if (config->max_results > BARCODE_MAX_RESULTS) {
+        return BARCODE_ERROR_PARAM;
+    }
+    
+    return BARCODE_OK;
+}
+
+/**
+ * @brief 分配内存缓冲??
+ */
+static barcode_status_e barcode_allocate_buffers(void)
+{
+    // 计算所需缓冲区大??
+    uint32_t pixel_count = g_barcode_ctx.config.img_width * g_barcode_ctx.config.img_height;
+    
+    switch (g_barcode_ctx.config.format) {
+        case BARCODE_FORMAT_GRAY:
+            g_barcode_ctx.buffer_size = pixel_count;
+            break;
+        case BARCODE_FORMAT_RGB565:
+            g_barcode_ctx.buffer_size = pixel_count * 2;
+            break;
+        case BARCODE_FORMAT_RGB888:
+            g_barcode_ctx.buffer_size = pixel_count * 3;
+            break;
+        case BARCODE_FORMAT_YUV422:
+            g_barcode_ctx.buffer_size = pixel_count * 2;
+            break;
+        default:
+            return BARCODE_ERROR_PARAM;
+    }
+    
+    // 分配内存
+    if (user_malloc != NULL) {
+        g_barcode_ctx.image_buffer = (uint8_t*)user_malloc(g_barcode_ctx.buffer_size);
+    } else {
+        // 使用静态缓冲区（需要定义足够大的静态数组）
+        static uint8_t static_buffer[BARCODE_IMAGE_WIDTH * BARCODE_IMAGE_HEIGHT * 3];
+        if (g_barcode_ctx.buffer_size <= sizeof(static_buffer)) {
+            g_barcode_ctx.image_buffer = static_buffer;
+        } else {
+            return BARCODE_ERROR_BUFFER_FULL;
+        }
+    }
+    
+    if (g_barcode_ctx.image_buffer == NULL) {
+        return BARCODE_ERROR_BUFFER_FULL;
+    }
+    
+    return BARCODE_OK;
+}
+
+/**
+ * @brief 释放内存缓冲??
+ */
+static void barcode_free_buffers(void)
+{
+    if (g_barcode_ctx.image_buffer != NULL && user_free != NULL) {
+        user_free(g_barcode_ctx.image_buffer);
+    }
+    g_barcode_ctx.image_buffer = NULL;
+    g_barcode_ctx.buffer_size = 0;
+}
+
+/**
+ * @brief 图像预处??
+ */
+static uint8_t barcode_preprocess_image(const uint8_t *src, uint8_t *dst, 
+                                       const image_preprocess_params_t *params)
+{
+    if (src == NULL || dst == NULL || params == NULL) {
+        return 0;
+    }
+    
+    // 简化的图像预处理实??
+    uint32_t pixel_count = g_barcode_ctx.config.img_width * g_barcode_ctx.config.img_height;
+    
+    for (uint32_t i = 0; i < pixel_count; i++) {
+        int16_t pixel = src[i];
+        
+        // 亮度调整
+        pixel += params->brightness_adjust;
+        
+        // 对比度调??
+        pixel = (pixel - 128) * (100 + params->contrast_adjust) / 100 + 128;
+        
+        // 限制范围
+        if (pixel < 0) pixel = 0;
+        if (pixel > 255) pixel = 255;
+        
+        dst[i] = (uint8_t)pixel;
+    }
+    
+    return 1;
+}
+
+/**
+ * @brief 检测QR码（简化实现）
+ */
+static uint8_t barcode_detect_qr_code(const uint8_t *image_data, 
+                                     barcode_result_t *results, uint8_t max_results)
+{
+    // 这里应该实现实际的QR码检测算??
+    // 由于空间限制，这里只提供框架代码
+    
+    uint8_t found_count = 0;
+    
+    // 模拟检测逻辑
+    for (uint16_t y = g_barcode_ctx.roi_y; 
+         y < g_barcode_ctx.roi_y + g_barcode_ctx.roi_height - 50 && found_count < max_results; 
+         y += 50) {
+        for (uint16_t x = g_barcode_ctx.roi_x; 
+             x < g_barcode_ctx.roi_x + g_barcode_ctx.roi_width - 50 && found_count < max_results; 
+             x += 50) {
+            
+            // 计算区域置信??
+            uint8_t confidence = barcode_calculate_confidence(
+                &image_data[y * g_barcode_ctx.config.img_width + x], 50, 50);
+            
+            if (confidence > g_barcode_ctx.config.confidence_thresh) {
+                // 模拟找到QR??
+                snprintf(results[found_count].data, BARCODE_MAX_DATA_LEN, 
+                        "QR_DATA_%d_%d", x, y);
+                results[found_count].type = BARCODE_TYPE_QR_CODE;
+                results[found_count].confidence = confidence;
+                results[found_count].x = x;
+                results[found_count].y = y;
+                results[found_count].width = 50;
+                results[found_count].height = 50;
+                results[found_count].data_len = strlen(results[found_count].data);
+                
+                if (barcode_validate_result(&results[found_count])) {
+                    found_count++;
+                }
+            }
+        }
+    }
+    
+    return found_count;
+}
+
+/**
+ * @brief 检测Code128（简化实现）
+ */
+static uint8_t barcode_detect_code128(const uint8_t *image_data, 
+                                     barcode_result_t *results, uint8_t max_results)
+{
+    // 简化的Code128检测实??
+    uint8_t found_count = 0;
+    
+    // 模拟水平扫描检测条形码
+    for (uint16_t y = g_barcode_ctx.roi_y; 
+         y < g_barcode_ctx.roi_y + g_barcode_ctx.roi_height && found_count < max_results; 
+         y += 30) {
+        
+        uint8_t confidence = barcode_calculate_confidence(
+            &image_data[y * g_barcode_ctx.config.img_width + g_barcode_ctx.roi_x], 
+            g_barcode_ctx.roi_width, 20);
+        
+        if (confidence > g_barcode_ctx.config.confidence_thresh) {
+            snprintf(results[found_count].data, BARCODE_MAX_DATA_LEN, 
+                    "CODE128_%d", y);
+            results[found_count].type = BARCODE_TYPE_CODE128;
+            results[found_count].confidence = confidence;
+            results[found_count].x = g_barcode_ctx.roi_x;
+            results[found_count].y = y;
+            results[found_count].width = g_barcode_ctx.roi_width;
+            results[found_count].height = 20;
+            results[found_count].data_len = strlen(results[found_count].data);
+            
+            if (barcode_validate_result(&results[found_count])) {
+                found_count++;
+            }
+        }
+    }
+    
+    return found_count;
+}
+
+/**
+ * @brief 检测EAN码（简化实现）
+ */
+static uint8_t barcode_detect_ean_codes(const uint8_t *image_data, 
+                                       barcode_result_t *results, uint8_t max_results)
+{
+    // 简化的EAN码检测实??
+    uint8_t found_count = 0;
+    
+    // 模拟EAN13检??
+    for (uint16_t y = g_barcode_ctx.roi_y; 
+         y < g_barcode_ctx.roi_y + g_barcode_ctx.roi_height && found_count < max_results; 
+         y += 40) {
+        
+        uint8_t confidence = barcode_calculate_confidence(
+            &image_data[y * g_barcode_ctx.config.img_width + g_barcode_ctx.roi_x], 
+            100, 25);
+        
+        if (confidence > g_barcode_ctx.config.confidence_thresh) {
+            snprintf(results[found_count].data, BARCODE_MAX_DATA_LEN, 
+                    "1234567890123"); // 模拟EAN13数据
+            results[found_count].type = BARCODE_TYPE_EAN13;
+            results[found_count].confidence = confidence;
+            results[found_count].x = g_barcode_ctx.roi_x;
+            results[found_count].y = y;
+            results[found_count].width = 100;
+            results[found_count].height = 25;
+            results[found_count].data_len = 13;
+            
+            if (barcode_validate_result(&results[found_count])) {
+                found_count++;
+            }
+        }
+    }
+    
+    return found_count;
+}
+
+/**
+ * @brief 更新统计信息
+ */
+static void barcode_update_stats(bool success)
+{
+    g_barcode_ctx.stats.total_detections++;
+    if (success) {
+        g_barcode_ctx.stats.success_detections++;
+    } else {
+        g_barcode_ctx.stats.failed_detections++;
+    }
+    g_barcode_ctx.stats.last_detect_time = user_get_timestamp_ms();
+}
+
+/**
+ * @brief 计算置信??
+ */
+static uint8_t barcode_calculate_confidence(const uint8_t *region, 
+                                           uint16_t width, uint16_t height)
+{
+    if (region == NULL || width == 0 || height == 0) {
+        return 0;
+    }
+    
+    // 简化的置信度计算：基于图像区域的方??
+    uint32_t sum = 0;
+    uint32_t sum_sq = 0;
+    uint32_t pixel_count = width * height;
+    
+    for (uint32_t i = 0; i < pixel_count; i++) {
+        uint8_t pixel = region[i];
+        sum += pixel;
+        sum_sq += pixel * pixel;
+    }
+    
+    uint32_t mean = sum / pixel_count;
+    uint32_t variance = (sum_sq / pixel_count) - (mean * mean);
+    
+    // 将方差映射到0-100的置信度
+    uint8_t confidence = (variance > 1000) ? 100 : (uint8_t)(variance / 10);
+    
+    return confidence;
+}
+
+/**
+ * @brief 验证检测结??
+ */
+static bool barcode_validate_result(const barcode_result_t *result)
+{
+    if (result == NULL) {
+        return false;
+    }
+    
+    // 检查数据长??
+    if (result->data_len == 0 || result->data_len >= BARCODE_MAX_DATA_LEN) {
+        return false;
+    }
+    
+    // 检查置信度
+    if (result->confidence < g_barcode_ctx.config.confidence_thresh) {
+        return false;
+    }
+    
+    // 检查边界框
+    if (result->width == 0 || result->height == 0) {
+        return false;
+    }
+    
+    // 检查类??
+    if (!BARCODE_IS_VALID_TYPE(result->type)) {
+        return false;
+    }
+    
+    return true;
+}
+
+/**
+ * @brief 过滤和去重结??
+ */
+static void barcode_filter_results(barcode_result_t *results, uint8_t *count)
+{
+    if (results == NULL || count == NULL || *count == 0) {
+        return;
+    }
+    
+    uint8_t valid_count = 0;
+    
+    // 去除重复和无效结??
+    for (uint8_t i = 0; i < *count; i++) {
+        if (!barcode_validate_result(&results[i])) {
+            continue;
+        }
+        
+        // 检查是否与已有结果重复
+        bool is_duplicate = false;
+        for (uint8_t j = 0; j < valid_count; j++) {
+            if (strcmp(results[i].data, results[j].data) == 0 &&
+                results[i].type == results[j].type) {
+                is_duplicate = true;
+                break;
+            }
+        }
+        
+        if (!is_duplicate) {
+            if (valid_count != i) {
+                results[valid_count] = results[i];
+            }
+            valid_count++;
+        }
+    }
+    
+    *count = valid_count;
+}
+
+/* ========================= 弱函数实现（默认实现?? ========================= */
+
+/**
+ * @brief 默认错误回调函数（弱函数??
+ */
+__attribute__((weak)) void user_error_callback(barcode_status_e error_code, const char *error_msg)
+{
+    // 默认空实现，用户可以重写
+    (void)error_code;
+    (void)error_msg;
+}
+
+/**
+ * @brief 默认调试输出函数（弱函数??
+ */
+__attribute__((weak)) void user_debug_printf(const char *format, ...)
+{
+    // 默认空实现，用户可以重写
+    (void)format;
+}
