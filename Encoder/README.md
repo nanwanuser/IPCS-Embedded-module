@@ -1,70 +1,73 @@
-# 编码器模块 (Encoder Module)
+# 编码器模块
 
-## 简介
+## 模块简介
 
-本模块是西南科技大学智能系统与智慧服务创新实践班嵌入式通用模块库的一部分，专为全国大学生电子设计大赛设计。提供完整的MG370霍尔编码器接口封装，支持转速检测、位置计算等功能。
+本模块提供MG370霍尔编码器的完整接口封装，适用于电机控制、机器人定位等需要精确测速和位置检测的应用场景。
 
-## 特性
-
+**主要特性：**
 - 支持多编码器实例管理（最大4个）
 - 自动处理定时器溢出
-- 实时转速和位置计算
-- 简单易用的API接口
-- **支持CMake构建系统（不支持MDK）**
+- 实时转速和位置计算  
+- 可配置的机械参数
+- 硬件无关设计，易于移植
 
-## 工具链要求
+## API函数接口
 
-⚠️ **重要：本模块使用CMake构建，不支持MDK**
+### 1. 初始化函数
 
-- **构建工具**: CMake 3.16+
-- **编译器**: arm-none-eabi-gcc
-- **推荐IDE**: CLion / VS Code + CMake Tools
+| 函数 | 功能 | 参数 | 返回值 |
+|------|------|------|--------|
+| `Encoder_QuickInit()` | 快速初始化编码器 | `TIM_HandleTypeDef *htim`<br>`encoder_handle_t *handle` | `MOTOR_OK`: 成功<br>`MOTOR_HARDWARE_ERROR`: 失败 |
+| `Encoder_Create()` | 创建编码器实例 | `TIM_HandleTypeDef *htim` | 编码器句柄 |
+| `Encoder_Init()` | 初始化编码器 | `encoder_handle_t handle` | `MOTOR_OK`: 成功<br>`MOTOR_HARDWARE_ERROR`: 失败 |
 
-## 硬件配置
+### 2. 数据读取函数
 
-### MG370编码器参数
-- 每圈脉冲数：13 PPR
-- 四倍频：52脉冲/转
-- 传动比：34:1
-- 轮胎半径：2.4mm（可修改）
+| 函数 | 功能 | 参数 | 返回值 | 单位 |
+|------|------|------|--------|------|
+| `Encoder_GetCount()` | 获取累计脉冲数 | `encoder_handle_t handle` | `int32_t` | 脉冲 |
+| `Encoder_GetSpeed()` | 获取转速 | `encoder_handle_t handle` | `int16_t` | RPM |
+| `Encoder_GetPosition()` | 获取累计位置 | `encoder_handle_t handle` | `float` | mm |
+| `Encoder_GetDistance()` | 获取增量距离 | `encoder_handle_t handle` | `float` | mm |
 
-### STM32定时器配置
+### 3. 控制函数
+
+| 函数 | 功能 | 参数 | 返回值 |
+|------|------|------|--------|
+| `Encoder_Reset()` | 复位编码器 | `encoder_handle_t handle` | 无 |
+| `Encoder_Calibrate()` | 校准编码器 | `encoder_handle_t handle` | `MOTOR_OK`: 成功<br>`MOTOR_HARDWARE_ERROR`: 失败 |
+| `Encoder_Destroy()` | 销毁编码器 | `encoder_handle_t handle` | 无 |
+| `Encoder_IsValid()` | 检查句柄有效性 | `encoder_handle_t handle` | 1: 有效<br>0: 无效 |
+
+### 4. 配置参数
+
+在 `encoder_module.h` 中修改以下宏定义适配不同编码器：
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `ENCODER_PPR` | 13 | 编码器每圈脉冲数 |
+| `WHEEL_RADIUS` | 2.4f | 轮胎半径(mm) |
+| `GEAR_RATIO` | 34 | 传动比 |
+| `ENCODER_SAMPLE_TIME` | 20 | 采样周期(ms) |
+| `MAX_ENCODER_COUNT` | 4 | 最大编码器数量 |
+
+## 使用示例
+
+### 1. STM32定时器配置
 使用STM32CubeMX配置定时器为编码器模式：
-1. 选择TIM2/TIM3/TIM4等定时器
-2. 模式设置：Combined Channels → Encoder Mode
-3. Encoder Mode: TI1 and TI2
-4. Counter Period: 65535
+- 模式：Combined Channels → Encoder Mode
+- 编码器模式：TI1 and TI2
+- 计数周期：65535
 
-## 快速开始
-
-### 1. 集成到项目
-
-将以下文件复制到项目中：
-```
-encoder_module.h
-encoder_module.c
-```
-
-### 2. CMake配置
-
-```cmake
-# 添加编码器模块
-add_library(encoder_module encoder_module.c)
-target_include_directories(encoder_module PUBLIC .)
-
-# 链接到主程序
-target_link_libraries(your_target encoder_module)
-```
-
-### 3. 基本使用
-
+### 2. 基本使用
 ```c
 #include "encoder_module.h"
 
-encoder_handle_t encoder;
-
-int main(void) {
-    // 系统初始化
+int main(void)
+{
+    encoder_handle_t encoder;
+    
+    // 硬件初始化
     HAL_Init();
     SystemClock_Config();
     MX_TIM2_Init();  // 定时器初始化
@@ -74,8 +77,8 @@ int main(void) {
         Error_Handler();
     }
     
-    while (1) {
-        // 读取数据
+    while(1) {
+        // 读取编码器数据
         int32_t count = Encoder_GetCount(encoder);
         int16_t speed = Encoder_GetSpeed(encoder);
         float position = Encoder_GetPosition(encoder);
@@ -86,126 +89,84 @@ int main(void) {
         HAL_Delay(100);
     }
 }
-```
-
-## API参考
-
-### 数据类型
-
-| 类型 | 说明 |
-|------|------|
-| `encoder_handle_t` | 编码器句柄（uint8_t） |
-| `Motor_Result_t` | 操作结果（MOTOR_OK/MOTOR_HARDWARE_ERROR） |
-
-### 管理函数
-
-| 函数 | 功能 | 参数 | 返回值 |
-|------|------|------|--------|
-| `Encoder_Create()` | 创建编码器实例 | `TIM_HandleTypeDef* htim` | 编码器句柄 |
-| `Encoder_Init()` | 初始化编码器 | `encoder_handle_t handle` | 操作结果 |
-| `Encoder_QuickInit()` | 快速初始化（推荐） | `TIM_HandleTypeDef* htim, encoder_handle_t* handle` | 操作结果 |
-| `Encoder_Destroy()` | 销毁编码器 | `encoder_handle_t handle` | 无 |
-
-### 数据获取函数
-
-| 函数 | 功能 | 参数 | 返回值 | 单位 |
-|------|------|------|--------|------|
-| `Encoder_GetCount()` | 获取累计脉冲数 | `encoder_handle_t handle` | `int32_t` | 脉冲 |
-| `Encoder_GetSpeed()` | 获取转速 | `encoder_handle_t handle` | `int16_t` | RPM |
-| `Encoder_GetPosition()` | 获取累计位置 | `encoder_handle_t handle` | `float` | mm |
-| `Encoder_GetDistance()` | 获取增量距离 | `encoder_handle_t handle` | `float` | mm |
-
-### 控制函数
-
-| 函数 | 功能 | 参数 | 返回值 |
-|------|------|------|--------|
-| `Encoder_Reset()` | 复位编码器 | `encoder_handle_t handle` | 无 |
-| `Encoder_Calibrate()` | 校准编码器 | `encoder_handle_t handle` | 操作结果 |
-| `Encoder_IsValid()` | 检查句柄有效性 | `encoder_handle_t handle` | 1=有效，0=无效 |
-
-## 使用示例
-
-### 单编码器使用
-
-```c
-encoder_handle_t my_encoder;
-
-// 初始化
-Encoder_QuickInit(&htim2, &my_encoder);
-
-// 读取数据
-int32_t count = Encoder_GetCount(my_encoder);
-int16_t speed = Encoder_GetSpeed(my_encoder);
-float position = Encoder_GetPosition(my_encoder);
-```
-
-### 双编码器使用
-
-```c
+3. 双编码器差速控制
+c// 左右轮编码器
 encoder_handle_t left_encoder, right_encoder;
 
-// 初始化两个编码器
-Encoder_QuickInit(&htim2, &left_encoder);
-Encoder_QuickInit(&htim3, &right_encoder);
-
-// 读取两轮数据
-int16_t left_speed = Encoder_GetSpeed(left_encoder);
-int16_t right_speed = Encoder_GetSpeed(right_encoder);
-```
-
-### 复位和校准
-
-```c
-// 复位编码器
-Encoder_Reset(my_encoder);
-
-// 校准编码器
-if (Encoder_Calibrate(my_encoder) == MOTOR_OK) {
-    printf("校准成功\n");
+void dual_encoder_init(void)
+{
+    // 初始化两个编码器
+    Encoder_QuickInit(&htim2, &left_encoder);
+    Encoder_QuickInit(&htim3, &right_encoder);
 }
-```
 
-## 参数配置
+void differential_control(void)
+{
+    // 读取左右轮速度
+    int16_t left_speed = Encoder_GetSpeed(left_encoder);
+    int16_t right_speed = Encoder_GetSpeed(right_encoder);
+    
+    // 计算车体速度和转向
+    int16_t linear_speed = (left_speed + right_speed) / 2;
+    int16_t angular_speed = (right_speed - left_speed);
+    
+    printf("线速度: %d RPM, 角速度: %d\n", linear_speed, angular_speed);
+}
+4. 位置闭环控制
+c// 目标位置控制
+void position_control(encoder_handle_t encoder, float target_position)
+{
+    float current_position = Encoder_GetPosition(encoder);
+    float error = target_position - current_position;
+    
+    if (fabs(error) > 1.0) {  // 死区1mm
+        // PID控制或其他控制算法
+        int16_t control_output = calculate_pid(error);
+        motor_set_pwm(control_output);
+    } else {
+        motor_stop();
+        printf("到达目标位置: %.1f mm\n", current_position);
+    }
+}
 
-在 `encoder_module.h` 中可修改的主要参数：
+// 定点移动
+void move_to_distance(encoder_handle_t encoder, float distance)
+{
+    Encoder_Reset(encoder);  // 复位当前位置
+    
+    while(1) {
+        float current_position = Encoder_GetPosition(encoder);
+        
+        if (fabs(current_position) >= fabs(distance)) {
+            motor_stop();
+            break;
+        }
+        
+        // 根据距离调整速度
+        int16_t speed = (distance > 0) ? 50 : -50;
+        motor_set_pwm(speed);
+        
+        HAL_Delay(10);
+    }
+}
+5. 速度平滑滤波
+c#define FILTER_SIZE 5
 
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `ENCODER_PPR` | 13 | 编码器每圈脉冲数 |
-| `WHEEL_RADIUS` | 2.4f | 轮胎半径（mm） |
-| `GEAR_RATIO` | 34 | 传动比 |
-| `ENCODER_SAMPLE_TIME` | 20 | 转速采样周期（ms） |
-| `MAX_ENCODER_COUNT` | 4 | 最大编码器数量 |
-
-## 故障排除
-
-| 问题 | 解决方案 |
-|------|----------|
-| 编码器计数不变 | 检查定时器是否正确初始化为编码器模式 |
-| 速度读数异常 | 检查采样周期设置和编码器连线 |
-| 初始化失败 | 确认定时器句柄有效且未被占用 |
-| 位置计算错误 | 检查机械参数配置是否正确 |
-
-## 移植说明
-
-### 适配其他编码器
-1. 修改 `ENCODER_PPR` 为实际编码器的PPR值
-2. 调整 `WHEEL_RADIUS` 和 `GEAR_RATIO` 参数
-3. 根据需要修改采样周期
-
-### 适配其他STM32型号
-1. 确认定时器支持编码器接口
-2. 根据定时器位数调整溢出参数
-3. 检查HAL库兼容性
-
-## 贡献指南
-
-1. Fork本仓库
-2. 创建新分支 (`git checkout -b feature/your-feature`)
-3. 提交更改 (`git commit -m 'Add: 功能描述'`)
-4. 推送到分支 (`git push origin feature/your-feature`)
-5. 创建Pull Request
-
-## 开源许可证
-
-MIT License
+// 速度滤波获取
+int16_t get_filtered_speed(encoder_handle_t encoder)
+{
+    static int16_t speed_buffer[FILTER_SIZE] = {0};
+    static uint8_t index = 0;
+    int32_t sum = 0;
+    
+    // 更新缓冲区
+    speed_buffer[index] = Encoder_GetSpeed(encoder);
+    index = (index + 1) % FILTER_SIZE;
+    
+    // 计算平均值
+    for (int i = 0; i < FILTER_SIZE; i++) {
+        sum += speed_buffer[i];
+    }
+    
+    return sum / FILTER_SIZE;
+}
