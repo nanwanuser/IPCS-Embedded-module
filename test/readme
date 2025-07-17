@@ -1,0 +1,94 @@
+# 完全兼容的条形码/二维码检测模块
+
+## 简介
+`WorkingBarcodeDetector` 是一个完全兼容的条形码/二维码检测模块，旨在解决所有 `pyzbar` 版本的兼容性问题。
+该模块支持多种条形码和二维码类型，包括 QR_CODE、CODE128、CODE39 等。
+它提供了图像预处理功能，以提高检测成功率，并能计算检测结果的置信度。
+此外，还支持生成二维码、提取详细信息以及获取支持信息等功能。
+
+## 功能特性
+1. 多码制支持：支持多种常见的条形码和二维码类型，如 QR_CODE、CODE128、CODE39 等。
+2. 图像预处理：提供图像预处理功能，包括灰度转换、直方图均衡化、高斯模糊、形态学操作等，以提高检测成功率。
+3. 置信度计算：计算每个检测结果的置信度，帮助用户评估检测结果的可靠性。
+4. 二维码生成：支持生成指定数据的二维码图像。
+5. 详细信息提取：根据不同的码制提取详细信息，如 URL、邮箱、电话号码、WiFi 信息等。
+6. 支持信息获取：获取模块支持的码制类型、`pyzbar` 版本和 `OpenCV` 版本等信息。
+
+## 安装依赖
+该模块依赖于以下库：
+- `opencv-python`
+- `pyzbar`
+- `qrcode`
+- `Pillow`
+
+可以使用以下命令安装这些依赖：
+```bash
+pip install opencv-python pyzbar qrcode Pillow
+```
+
+## 使用方法
+
+### 初始化检测器
+```python
+from test import WorkingBarcodeDetector
+
+# 创建检测器实例
+detector = WorkingBarcodeDetector(enable_preprocessing=True, debug_mode=True)
+```
+
+### 生成二维码
+```python
+test_data = "https://www.example.com - 测试数据"
+qr_image = detector.generate_qr_code(test_data)
+if qr_image is not None:
+    cv2.imwrite("working_test_qr.png", qr_image)
+    print("二维码已保存到 working_test_qr.png")
+```
+
+### 从图像中检测条形码/二维码
+```python
+try:
+    results = detector.detect_from_image("working_test_qr.png")
+
+    if results:
+        print(f"检测到 {len(results)} 个码:")
+        for i, result in enumerate(results):
+            print(f"\n结果 {i + 1}:")
+            print(f"  数据: {result.data}")
+            print(f"  类型: {result.code_type.value}")
+            print(f"  置信度: {result.confidence:.2f}")
+            print(f"  位置: {result.bbox}")
+
+            # 获取详细信息
+            detail_info = detector.extract_detailed_info(result)
+            print(f"  详细信息: {detail_info}")
+    else:
+        print("未检测到任何码")
+
+except Exception as e:
+    print(f"检测失败: {e}")
+```
+
+### 获取支持信息
+```python
+support_info = detector.get_support_info()
+print(f"\n支持信息:")
+print(f"  OpenCV版本: {support_info['opencv_version']}")
+print(f"  pyzbar版本: {support_info['pyzbar_version']}")
+print(f"  支持的类型数量: {support_info['total_supported_types']}")
+print(f"  支持的类型: {', '.join(support_info['supported_type_names'])}")
+```
+
+## 代码结构
+- `WorkingBarcodeDetector` 类：主类，包含初始化、检测、生成二维码等功能。
+- `CodeType` 枚举类：定义支持的码制类型。
+- `DetectionResult` 数据类：存储检测结果的相关信息。
+- `demo_usage` 函数：演示模块的使用方法。
+
+## 注意事项
+- 在使用 `detect_from_image` 方法时，如果传入的是文件路径，确保文件存在且路径正确。
+- 图像预处理功能可以提高检测成功率，但可能会增加处理时间。可以通过 `enable_preprocessing` 参数控制是否启用该功能。
+
+## 贡献
+如果你发现任何问题或有改进建议，请随时提交 issue 或 pull request。
+

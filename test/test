@@ -1,0 +1,500 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+完全兼容的条形码/二维码检测模??
+解决所有pyzbar版本兼容性问??
+文件??: working_barcode_detector.py
+"""
+
+import cv2
+import numpy as np
+from pyzbar import pyzbar
+import qrcode
+from PIL import Image, ImageEnhance
+import logging
+from typing import List, Dict, Tuple, Optional, Union
+from dataclasses import dataclass
+from enum import Enum
+import base64
+import io
+
+# 配置日志
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+class CodeType(Enum):
+    """支持的码制类??"""
+    QR_CODE = "QR_CODE"
+    CODE128 = "CODE128"
+    CODE39 = "CODE39"
+    EAN13 = "EAN13"
+    EAN8 = "EAN8"
+    UPC_A = "UPC_A"
+    UPC_E = "UPC_E"
+    DATAMATRIX = "DATAMATRIX"
+    PDF417 = "PDF417"
+    AZTEC = "AZTEC"
+    UNKNOWN = "UNKNOWN"
+
+
+@dataclass
+class DetectionResult:
+    """检测结果数据类"""
+    data: str
+    code_type: CodeType
+    confidence: float
+    bbox: Tuple[int, int, int, int]  # (x, y, width, height)
+    corners: List[Tuple[int, int]]  # 四个角点坐标
+    raw_data: bytes = None
+
+
+class WorkingBarcodeDetector:
+    """完全兼容的条形码/二维码检测器主类"""
+
+    def __init__(self, enable_preprocessing: bool = True, debug_mode: bool = False):
+        """
+        初始化检测器
+
+        Args:
+            enable_preprocessing: 是否启用图像预处??
+            debug_mode: 是否启用调试模式
+        """
+        self.enable_preprocessing = enable_preprocessing
+        self.debug_mode = debug_mode
+
+        # 安全地初始化支持的类??
+        self.supported_types = []
+        self._init_supported_types()
+
+        if self.debug_mode:
+            print(f"检测器初始化完成，支持 {len(self.supported_types)} 种条形码类型")
+
+    def _init_supported_types(self):
+        """安全地初始化支持的条形码类型"""
+        # 定义所有可能的类型名称
+        possible_types = [
+            'QRCODE', 'CODE128', 'CODE39', 'EAN13', 'EAN8',
+            'UPCA', 'UPCE', 'DATAMATRIX', 'PDF417', 'AZTEC'
+        ]
+
+        # 安全地检查并添加支持的类??
+        for type_name in possible_types:
+            try:
+                if hasattr(pyzbar.ZBarSymbol, type_name):
+                    symbol = getattr(pyzbar.ZBarSymbol, type_name)
+                    self.supported_types.append(symbol)
+                    if self.debug_mode:
+                        print(f"?? 支持 {type_name}")
+                elif self.debug_mode:
+                    print(f"?? 不支?? {type_name}")
+            except Exception as e:
+                if self.debug_mode:
+                    print(f"??  检?? {type_name} 时出??: {e}")
+
+    def _map_zbar_type_to_code_type(self, zbar_type) -> CodeType:
+        """将pyzbar类型映射到自定义CodeType"""
+        # 创建安全的映射字??
+        mapping = {}
+
+        # 类型映射??
+        type_map = [
+            ('QRCODE', CodeType.QR_CODE),
+            ('CODE128', CodeType.CODE128),
+            ('CODE39', CodeType.CODE39),
+            ('EAN13', CodeType.EAN13),
+            ('EAN8', CodeType.EAN8),
+            ('UPCA', CodeType.UPC_A),
+            ('UPCE', CodeType.UPC_E),
+            ('DATAMATRIX', CodeType.DATAMATRIX),
+            ('PDF417', CodeType.PDF417),
+            ('AZTEC', CodeType.AZTEC),
+        ]
+
+        # 只添加实际存在的映射
+        for attr_name, code_type in type_map:
+            try:
+                if hasattr(pyzbar.ZBarSymbol, attr_name):
+                    zbar_symbol = getattr(pyzbar.ZBarSymbol, attr_name)
+                    mapping[zbar_symbol] = code_type
+            except:
+                continue
+
+        return mapping.get(zbar_type, CodeType.UNKNOWN)
+
+    def _preprocess_image(self, image: np.ndarray) -> List[np.ndarray]:
+        """
+        图像预处理，生成多个候选图像以提高检测成功率
+        """
+        processed_images = [image]
+
+        if not self.enable_preprocessing:
+            return processed_images
+
+        try:
+            # 转换为灰度图
+            if len(image.shape) == 3:
+                gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            else:
+                gray = image.copy()
+
+            processed_images.append(gray)
+
+            # 自适应直方图均衡化
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            enhanced = clahe.apply(gray)
+            processed_images.append(enhanced)
+
+            # 高斯模糊去噪
+            blurred = cv2.GaussianBlur(gray, (3, 3), 0)
+            processed_images.append(blurred)
+
+            # 形态学操作
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+            morphed = cv2.morphologyEx(gray, cv2.MORPH_CLOSE, kernel)
+            processed_images.append(morphed)
+
+            # 锐化
+            kernel_sharp = np.array([[-1, -1, -1], [-1, 9, -1], [-1, -1, -1]])
+            sharpened = cv2.filter2D(gray, -1, kernel_sharp)
+            processed_images.append(sharpened)
+
+            # 二值化（多种阈值方法）
+            _, binary1 = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            processed_images.append(binary1)
+
+            binary2 = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                            cv2.THRESH_BINARY, 11, 2)
+            processed_images.append(binary2)
+
+        except Exception as e:
+            logger.warning(f"图像预处理出现错??: {e}")
+
+        return processed_images
+
+    def _detect_with_pyzbar(self, image: np.ndarray) -> List[DetectionResult]:
+        """使用pyzbar进行检??"""
+        results = []
+
+        try:
+            # 安全地进行检??
+            if self.supported_types:
+                # 使用指定的符号类??
+                decoded_objects = pyzbar.decode(image, symbols=self.supported_types)
+            else:
+                # 使用默认检??
+                decoded_objects = pyzbar.decode(image)
+
+            for obj in decoded_objects:
+                try:
+                    # 提取数据
+                    data = obj.data.decode('utf-8', errors='ignore')
+                    code_type = self._map_zbar_type_to_code_type(obj.type)
+
+                    # 计算边界??
+                    x, y, w, h = obj.rect
+                    bbox = (x, y, w, h)
+
+                    # 提取角点
+                    corners = [(point.x, point.y) for point in obj.polygon]
+
+                    # 计算置信??
+                    confidence = self._calculate_confidence(obj, image)
+
+                    result = DetectionResult(
+                        data=data,
+                        code_type=code_type,
+                        confidence=confidence,
+                        bbox=bbox,
+                        corners=corners,
+                        raw_data=obj.data
+                    )
+
+                    results.append(result)
+
+                except Exception as e:
+                    logger.warning(f"解析检测结果时出错: {e}")
+                    continue
+
+        except Exception as e:
+            logger.error(f"pyzbar检测失??: {e}")
+
+        return results
+
+    def _calculate_confidence(self, obj, image: np.ndarray) -> float:
+        """计算检测置信度"""
+        try:
+            # 基于多边形面??
+            polygon_area = cv2.contourArea(np.array([(p.x, p.y) for p in obj.polygon]))
+            image_area = image.shape[0] * image.shape[1]
+            area_ratio = polygon_area / image_area
+
+            # 基于数据完整??
+            data_quality = min(1.0, len(obj.data) / 10.0)
+
+            # 基于边界框规律??
+            rect_area = obj.rect.width * obj.rect.height
+            shape_regularity = min(1.0, polygon_area / rect_area) if rect_area > 0 else 0.5
+
+            # 综合置信??
+            confidence = (area_ratio * 0.3 + data_quality * 0.4 + shape_regularity * 0.3)
+            return min(1.0, max(0.0, confidence))
+
+        except Exception as e:
+            logger.warning(f"计算置信度时出错: {e}")
+            return 0.5
+
+    def detect_from_image(self, image: Union[np.ndarray, str]) -> List[DetectionResult]:
+        """
+        从图像中检测条形码/二维??
+        """
+        if isinstance(image, str):
+            # 从文件路径加载图??
+            img = cv2.imread(image)
+            if img is None:
+                raise ValueError(f"无法加载图像: {image}")
+        else:
+            img = image.copy()
+
+        all_results = []
+
+        # 获取预处理后的图像列??
+        processed_images = self._preprocess_image(img)
+
+        # 在每个预处理图像上尝试检??
+        for i, proc_img in enumerate(processed_images):
+            try:
+                if self.debug_mode:
+                    print(f"正在处理?? {i + 1}/{len(processed_images)} 个预处理图像")
+
+                results = self._detect_with_pyzbar(proc_img)
+                all_results.extend(results)
+
+            except Exception as e:
+                logger.warning(f"处理?? {i + 1} 个图像时出错: {e}")
+                continue
+
+        # 去重和筛选最佳结??
+        unique_results = self._filter_and_deduplicate_results(all_results)
+
+        if self.debug_mode:
+            print(f"总共检测到 {len(unique_results)} 个有效码")
+
+        return unique_results
+
+    def _filter_and_deduplicate_results(self, results: List[DetectionResult]) -> List[DetectionResult]:
+        """去重和筛选最佳结??"""
+        if not results:
+            return []
+
+        # 按数据内容分??
+        grouped = {}
+        for result in results:
+            key = (result.data, result.code_type)
+            if key not in grouped:
+                grouped[key] = []
+            grouped[key].append(result)
+
+        # 为每组选择置信度最高的结果
+        best_results = []
+        for group in grouped.values():
+            best_result = max(group, key=lambda x: x.confidence)
+            # 只保留置信度较高的结??
+            if best_result.confidence > 0.1:
+                best_results.append(best_result)
+
+        # 按置信度排序
+        best_results.sort(key=lambda x: x.confidence, reverse=True)
+
+        return best_results
+
+    def generate_qr_code(self, data: str, size: int = 10, border: int = 4) -> np.ndarray:
+        """
+        生成二维??
+        """
+        try:
+            qr = qrcode.QRCode(
+                version=1,
+                error_correction=qrcode.constants.ERROR_CORRECT_L,
+                box_size=size,
+                border=border,
+            )
+            qr.add_data(data)
+            qr.make(fit=True)
+
+            # 创建图像
+            pil_image = qr.make_image(fill_color="black", back_color="white")
+
+            # 转换为OpenCV格式
+            opencv_image = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
+
+            return opencv_image
+
+        except Exception as e:
+            logger.error(f"生成二维码失??: {e}")
+            return None
+
+    def extract_detailed_info(self, result: DetectionResult) -> Dict:
+        """
+        提取详细信息
+        """
+        info = {
+            'data': result.data,
+            'code_type': result.code_type.value,
+            'confidence': result.confidence,
+            'bbox': result.bbox,
+            'corners': result.corners,
+            'data_length': len(result.data),
+            'raw_data_length': len(result.raw_data) if result.raw_data else 0,
+        }
+
+        # 根据不同码制提取特定信息
+        if result.code_type == CodeType.QR_CODE:
+            info.update(self._extract_qr_info(result))
+        elif result.code_type in [CodeType.EAN13, CodeType.EAN8, CodeType.UPC_A, CodeType.UPC_E]:
+            info.update(self._extract_product_code_info(result))
+
+        return info
+
+    def _extract_qr_info(self, result: DetectionResult) -> Dict:
+        """提取二维码特定信??"""
+        info = {}
+        data = result.data
+
+        # 检测URL
+        if data.startswith(('http://', 'https://')):
+            info['content_type'] = 'URL'
+            info['url'] = data
+
+        # 检测邮??
+        elif '@' in data and '.' in data:
+            info['content_type'] = 'EMAIL'
+            info['email'] = data
+
+        # 检测电话号??
+        elif data.startswith('tel:'):
+            info['content_type'] = 'PHONE'
+            info['phone'] = data[4:]
+
+        # 检测WiFi信息
+        elif data.startswith('WIFI:'):
+            info['content_type'] = 'WIFI'
+            info.update(self._parse_wifi_qr(data))
+
+        else:
+            info['content_type'] = 'TEXT'
+
+        return info
+
+    def _extract_product_code_info(self, result: DetectionResult) -> Dict:
+        """提取商品码信??"""
+        info = {}
+        data = result.data
+
+        if result.code_type == CodeType.EAN13 and len(data) == 13:
+            info['country_code'] = data[:3]
+            info['manufacturer_code'] = data[3:8]
+            info['product_code'] = data[8:12]
+            info['check_digit'] = data[12]
+
+        elif result.code_type == CodeType.EAN8 and len(data) == 8:
+            info['country_code'] = data[:3]
+            info['product_code'] = data[3:7]
+            info['check_digit'] = data[7]
+
+        return info
+
+    def _parse_wifi_qr(self, data: str) -> Dict:
+        """解析WiFi二维??"""
+        wifi_info = {}
+        try:
+            # 格式: WIFI:T:WPA;S:SSID;P:password;H:;;
+            parts = data.split(';')
+            for part in parts:
+                if ':' in part:
+                    key, value = part.split(':', 1)
+                    if key == 'T':
+                        wifi_info['security_type'] = value
+                    elif key == 'S':
+                        wifi_info['ssid'] = value
+                    elif key == 'P':
+                        wifi_info['password'] = value
+                    elif key == 'H':
+                        wifi_info['hidden'] = value == 'true'
+        except Exception as e:
+            logger.warning(f"解析WiFi二维码失??: {e}")
+
+        return wifi_info
+
+    def get_support_info(self) -> Dict:
+        """获取支持信息"""
+        info = {
+            'total_supported_types': len(self.supported_types),
+            'pyzbar_version': getattr(pyzbar, '__version__', 'unknown'),
+            'opencv_version': cv2.__version__,
+            'supported_type_names': []
+        }
+
+        # 获取支持的类型名??
+        type_names = ['QRCODE', 'CODE128', 'CODE39', 'EAN13', 'EAN8',
+                      'UPCA', 'UPCE', 'DATAMATRIX', 'PDF417', 'AZTEC']
+
+        for type_name in type_names:
+            if hasattr(pyzbar.ZBarSymbol, type_name):
+                info['supported_type_names'].append(type_name)
+
+        return info
+
+
+# 使用示例和测试函??
+def demo_usage():
+    """演示模块使用方法"""
+    print("=== 完全兼容的条形码/二维码检测模块演?? ===")
+
+    # 创建检测器实例
+    detector = WorkingBarcodeDetector(enable_preprocessing=True, debug_mode=True)
+
+    # 显示支持信息
+    support_info = detector.get_support_info()
+    print(f"\n支持信息:")
+    print(f"  OpenCV版本: {support_info['opencv_version']}")
+    print(f"  pyzbar版本: {support_info['pyzbar_version']}")
+    print(f"  支持的类型数??: {support_info['total_supported_types']}")
+    print(f"  支持的类??: {', '.join(support_info['supported_type_names'])}")
+
+    # 生成测试二维??
+    print("\n1. 生成测试二维??...")
+    test_data = "https://www.example.com - 测试数据"
+    qr_image = detector.generate_qr_code(test_data)
+    if qr_image is not None:
+        cv2.imwrite("working_test_qr.png", qr_image)
+        print("二维码已保存?? working_test_qr.png")
+
+    # 检测生成的二维??
+    print("\n2. 检测生成的二维??...")
+    try:
+        results = detector.detect_from_image("working_test_qr.png")
+
+        if results:
+            print(f"检测到 {len(results)} 个码:")
+            for i, result in enumerate(results):
+                print(f"\n结果 {i + 1}:")
+                print(f"  数据: {result.data}")
+                print(f"  类型: {result.code_type.value}")
+                print(f"  置信??: {result.confidence:.2f}")
+                print(f"  位置: {result.bbox}")
+
+                # 获取详细信息
+                detail_info = detector.extract_detailed_info(result)
+                print(f"  详细信息: {detail_info}")
+        else:
+            print("未检测到任何??")
+
+    except Exception as e:
+        print(f"检测失??: {e}")
+
+    print("\n=== 演示完成 ===")
+
+
+if __name__ == "__main__":
+    demo_usage()
